@@ -228,15 +228,18 @@ class LlavaMetaForCausalLM(ABC):
 
         new_input_embeds = []
         new_labels = []
+        image_segments = [] # 记录每个序列中的图像片段位置和长度，用于后续创建增强的attention mask
         cur_image_idx = 0
         for batch_idx, cur_input_ids in enumerate(input_ids):
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
+            cur_image_segments = []  # 记录当前样本的图像片段位置
             if num_images == 0:
                 cur_image_features = image_features[cur_image_idx]
                 cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
                 cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
                 new_input_embeds.append(cur_input_embeds)
                 new_labels.append(labels[batch_idx])
+                image_segments.append(cur_image_segments)
                 cur_image_idx += 1
                 continue
 
@@ -252,21 +255,30 @@ class LlavaMetaForCausalLM(ABC):
             cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
             cur_new_input_embeds = []
             cur_new_labels = []
+            cur_position = 0  # 跟踪当前位置
 
             for i in range(num_images + 1):
+                text_len = cur_input_embeds_no_im[i].shape[0]
+                cur_position += text_len
                 cur_new_input_embeds.append(cur_input_embeds_no_im[i])
                 cur_new_labels.append(cur_labels_noim[i])
                 if i < num_images:
                     cur_image_features = image_features[cur_image_idx]
+                    img_len = cur_image_features.shape[0]
+                    cur_image_segments.append((cur_position, img_len))
+                    cur_position += img_len
+                    
                     cur_image_idx += 1
                     cur_new_input_embeds.append(cur_image_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
 
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
-
+            
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
-
+            
+            image_segments.append(cur_image_segments)
+            
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
 
@@ -282,6 +294,7 @@ class LlavaMetaForCausalLM(ABC):
 
         new_input_embeds_padded = []
         new_labels_padded = torch.full((batch_size, max_len), IGNORE_INDEX, dtype=new_labels[0].dtype, device=new_labels[0].device)
+        
         attention_mask = torch.zeros((batch_size, max_len), dtype=attention_mask.dtype, device=attention_mask.device)
         position_ids = torch.zeros((batch_size, max_len), dtype=position_ids.dtype, device=position_ids.device)
 
@@ -294,7 +307,16 @@ class LlavaMetaForCausalLM(ABC):
                 ), dim=0))
                 if cur_len > 0:
                     new_labels_padded[i, -cur_len:] = cur_new_labels
-                    attention_mask[i, -cur_len:] = True
+                    # 设置基础attention mask（有效内容为1，填充为0）
+                    attention_mask[i, -cur_len:] = 1
+                    
+                    # 图像部分的attention mask设置为从2开始的递增值
+                    for j in range(len(image_segments[i])):
+                        start_pos, img_len = image_segments[i][j]
+                        # 需要调整起始位置以考虑左侧填充
+                        adj_start = max_len - cur_len + start_pos
+                        attention_mask[i, adj_start:adj_start + img_len] = j+2
+                    
                     position_ids[i, -cur_len:] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
             else:
                 new_input_embeds_padded.append(torch.cat((
@@ -303,7 +325,10 @@ class LlavaMetaForCausalLM(ABC):
                 ), dim=0))
                 if cur_len > 0:
                     new_labels_padded[i, :cur_len] = cur_new_labels
-                    attention_mask[i, :cur_len] = True
+                    attention_mask[i, :cur_len] = 1
+                    for j in range(len(image_segments[i])):
+                        start_pos, img_len = image_segments[i][j]
+                        attention_mask[i, start_pos:start_pos + img_len] = j+2
                     position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
 
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
@@ -313,10 +338,10 @@ class LlavaMetaForCausalLM(ABC):
         else:
             new_labels = new_labels_padded
 
-        if _attention_mask is None:
-            attention_mask = None
-        else:
-            attention_mask = attention_mask.to(dtype=_attention_mask.dtype)
+        #if _attention_mask is None:
+        #    attention_mask = None
+        #else:
+        #    attention_mask = attention_mask.to(dtype=_attention_mask.dtype)
 
         if _position_ids is None:
             position_ids = None
